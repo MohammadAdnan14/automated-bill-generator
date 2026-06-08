@@ -42,6 +42,7 @@ class BillValidator:
     def validate_party(self, party_name: str) -> Tuple[str, float, str]:
         """
         Validate party name against party list.
+        Quietly converts to the closest match in the master list.
         
         Returns:
             (resolved_party_name, confidence, flag_message)
@@ -54,29 +55,40 @@ class BillValidator:
             return party_name, 1.0, None
         
         # Remove M/S prefix for matching
-        party_clean = party_name.replace("M/S ", "").strip()
+        import re
+        party_clean = re.sub(r'^(M/S\.?|M/S\s+)', '', party_name, flags=re.IGNORECASE).strip().upper()
         
         # Exact match
         if party_clean in self.party_list:
             canonical = self.party_list[party_clean]
             return f"M/S {canonical}", 1.0, None
         
-        # Fuzzy match
+        # Fuzzy match to find the closest match quietly
         best_match = None
-        best_score = 0
+        best_score = 0.0
         
-        for key in self.party_list.keys():
-            score = self.fuzzy_match(party_clean, key)
+        for key, canonical in self.party_list.items():
+            key_clean = re.sub(r'^(M/S\.?|M/S\s+)', '', key, flags=re.IGNORECASE).strip().upper()
+            
+            # Match against the full candidate name
+            score = self.fuzzy_match(party_clean, key_clean)
+            
+            # Match against the first word or words of key_clean for partial names
+            key_words = key_clean.split()
+            if key_words:
+                word_score = self.fuzzy_match(party_clean, key_words[0])
+                score = max(score, word_score * 0.9)  # slight penalty for word-only match
+                
             if score > best_score:
                 best_score = score
-                best_match = key
+                best_match = canonical
         
-        if best_score >= self.fuzzy_match_threshold:
-            canonical = self.party_list[best_match]
-            return f"M/S {canonical}", best_score, None
+        # Quietly convert to the closest match if any reasonable candidate exists
+        if best_score >= 0.4:
+            return f"M/S {best_match}", best_score, None
         else:
-            # No good match found
-            return "UNCLEAR", 0.0, f"Party '{party_name}' not found in master list (closest match: {best_match} with {best_score:.1%} confidence)"
+            # No candidate found
+            return "UNCLEAR", 0.0, f"Party '{party_name}' could not be matched to any party in master list"
     
     def validate_entry(self, entry: Dict[str, Any]) -> Tuple[List[Dict], bool]:
         """
@@ -87,8 +99,19 @@ class BillValidator:
         """
         flags = []
         
-        # Rule 1: Confidence < HIGH
-        for field in ['date', 'katta', 'rate', 'party', 'bill_details']:
+        # Step 1: Normalize party name BEFORE verification
+        party_name = entry.get('party', 'UNCLEAR')
+        entry['original_party'] = party_name  # Save original party name before normalization
+        if self.party_list:
+            resolved_party, score, flag_msg = self.validate_party(party_name)
+            entry['party'] = resolved_party
+            if resolved_party != "UNCLEAR":
+                entry['party_confidence'] = 'HIGH'
+            else:
+                entry['party_confidence'] = 'LOW'
+        
+        # Rule 1: Confidence < HIGH (Excluding Rate, and checking Bill Details only if LOW)
+        for field in ['date', 'katta', 'party']:
             confidence = entry.get(f'{field}_confidence')
             if confidence in ['MEDIUM', 'LOW']:
                 flags.append({
@@ -100,25 +123,26 @@ class BillValidator:
                     'message': f'{field.replace("_", " ").title()} has {confidence} confidence (legibility issue)'
                 })
         
-        # Rule 2: Party = UNCLEAR or not in list
+        bill_details_conf = entry.get('bill_details_confidence')
+        if bill_details_conf == 'LOW':
+            flags.append({
+                'type': 'LOW_CONFIDENCE',
+                'field': 'bill_details',
+                'value': entry.get('bill_details'),
+                'confidence': 'LOW',
+                'severity': 'HIGH',
+                'message': 'Bill Details has LOW confidence (legibility issue)'
+            })
+        
+        # Rule 2: Party = UNCLEAR
         party = entry.get('party', 'UNCLEAR')
-        if self.party_list:
-            resolved_party, confidence, flag_msg = self.validate_party(party)
-            if resolved_party == "UNCLEAR" or confidence < self.fuzzy_match_threshold:
-                flags.append({
-                    'type': 'UNCLEAR_PARTY',
-                    'field': 'party',
-                    'value': party,
-                    'severity': 'HIGH',
-                    'message': flag_msg or 'Party name is unclear or unreadable'
-                })
-        elif party == "UNCLEAR":
+        if party == "UNCLEAR" or party == "M/S UNCLEAR":
             flags.append({
                 'type': 'UNCLEAR_PARTY',
                 'field': 'party',
-                'value': 'UNCLEAR',
+                'value': party,
                 'severity': 'HIGH',
-                'message': 'Party name is unclear or unreadable'
+                'message': 'Party name is unclear or could not be matched to master list'
             })
         
         # Rule 3: Date outside bill period
@@ -162,16 +186,27 @@ class BillValidator:
             })
         
         # Rule 5: Outlier values (sanity check)
+        # Parse Katta (supporting commercial units like "30 BAGS" without crash)
         try:
-            katta = float(entry['katta'])
+            katta_val = entry['katta']
+            import re
+            if isinstance(katta_val, str):
+                num_match = re.search(r'([\d\.]+)', katta_val)
+                if num_match:
+                    katta = float(num_match.group(1))
+                else:
+                    raise ValueError("No numeric part found in katta")
+            else:
+                katta = float(katta_val)
+                
             if katta < self.typical_katta_range[0] or katta > self.typical_katta_range[1]:
                 flags.append({
                     'type': 'KATTA_OUTLIER',
                     'field': 'katta',
-                    'value': katta,
+                    'value': katta_val,
                     'typical_range': f'{self.typical_katta_range[0]}-{self.typical_katta_range[1]}',
                     'severity': 'MEDIUM',
-                    'message': f'Katta {katta} is outside typical range {self.typical_katta_range[0]}-{self.typical_katta_range[1]}'
+                    'message': f'Katta {katta_val} is outside typical range {self.typical_katta_range[0]}-{self.typical_katta_range[1]}'
                 })
         except Exception as e:
             flags.append({
@@ -182,24 +217,38 @@ class BillValidator:
                 'message': f'Cannot parse katta as number'
             })
         
+        # Parse and check Rate (outliers are blanked out in entry)
         try:
-            rate = float(entry['rate'])
-            if rate < self.typical_rate_range[0] or rate > self.typical_rate_range[1]:
+            rate_val = entry.get('rate')
+            if rate_val is None or str(rate_val).strip() in ['', 'None', 'null']:
+                entry['rate'] = ''
                 flags.append({
-                    'type': 'RATE_OUTLIER',
+                    'type': 'RATE_MISSING',
                     'field': 'rate',
-                    'value': rate,
-                    'typical_range': f'{self.typical_rate_range[0]}-{self.typical_rate_range[1]}',
+                    'value': '',
                     'severity': 'MEDIUM',
-                    'message': f'Rate {rate} is outside typical range {self.typical_rate_range[0]}-{self.typical_rate_range[1]}'
+                    'message': 'Rate is missing'
                 })
+            else:
+                rate = float(rate_val)
+                if rate < self.typical_rate_range[0] or rate > self.typical_rate_range[1]:
+                    entry['rate'] = ''  # Blank out implausible rate
+                    flags.append({
+                        'type': 'RATE_OUTLIER',
+                        'field': 'rate',
+                        'value': rate_val,
+                        'typical_range': f'{self.typical_rate_range[0]}-{self.typical_rate_range[1]}',
+                        'severity': 'HIGH',
+                        'message': f'Rate {rate_val} is implausible and has been left blank'
+                    })
         except Exception as e:
+            entry['rate'] = ''  # Blank out
             flags.append({
                 'type': 'RATE_PARSE_ERROR',
                 'field': 'rate',
                 'value': entry.get('rate'),
                 'severity': 'HIGH',
-                'message': f'Cannot parse rate as number'
+                'message': f'Cannot parse rate as number, left blank'
             })
         
         # Rule 6: Missing bill details (when confidence is LOW)
@@ -213,7 +262,7 @@ class BillValidator:
             })
         
         # Rule 7: Digit 6 problem (special handling)
-        for field in ['katta', 'rate']:
+        for field in ['katta']:
             if entry.get(f'{field}_confidence') in ['MEDIUM', 'LOW']:
                 field_value = str(entry.get(field, ''))
                 if any(char in field_value for char in ['5', '6', '8', '9']):
@@ -223,6 +272,21 @@ class BillValidator:
                         'value': entry.get(field),
                         'severity': 'HIGH',
                         'message': f'{field.title()} contains digits that could be misread (especially 6 vs 5/8/9)'
+                    })
+                    
+        # Check date for digit 6 risk
+        if entry.get('date_confidence') in ['MEDIUM', 'LOW']:
+            date_value = str(entry.get('date', ''))
+            parts = date_value.split('-')
+            if len(parts) >= 2:
+                day_month = parts[0] + parts[1]
+                if any(char in day_month for char in ['0', '6', '8']):
+                    flags.append({
+                        'type': 'DIGIT_6_RISK',
+                        'field': 'date',
+                        'value': date_value,
+                        'severity': 'HIGH',
+                        'message': 'Date contains day/month digits that could be misread (especially 6 vs 0/8)'
                     })
         
         needs_review = len(flags) > 0
@@ -311,121 +375,612 @@ def load_party_list(party_list_file: str) -> Dict[str, str]:
 
 def generate_verification_report(validation_result: Dict[str, Any]) -> str:
     """
-    Generate HTML verification report for user review.
+    Generate a redesigned compact HTML verification report for user review.
     """
-    html = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="UTF-8">
-        <title>Bill Verification Report</title>
-        <style>
-            body { font-family: Arial, sans-serif; margin: 20px; background-color: #f5f5f5; }
-            .header { background-color: #2E75B6; color: white; padding: 20px; border-radius: 5px; margin-bottom: 20px; }
-            .summary { background-color: #e8f4f8; padding: 15px; border-left: 4px solid #2E75B6; margin-bottom: 20px; }
-            .summary-stat { display: inline-block; margin-right: 30px; }
-            .summary-stat .label { color: #666; font-size: 12px; }
-            .summary-stat .value { font-size: 20px; font-weight: bold; color: #2E75B6; }
-            .entry { background-color: white; padding: 15px; margin-bottom: 15px; border-radius: 5px; border-left: 4px solid #ccc; }
-            .entry.flagged { border-left-color: #d9534f; background-color: #fff5f5; }
-            .entry.clean { border-left-color: #5cb85c; background-color: #f5fff5; }
-            .entry-header { font-weight: bold; margin-bottom: 10px; }
-            .entry-number { color: #666; font-size: 12px; }
-            .flag { background-color: #fcf8e3; padding: 10px; margin: 8px 0; border-left: 3px solid #ffc107; font-size: 13px; }
-            .flag.high { border-left-color: #d9534f; background-color: #f2dede; }
-            .flag.medium { border-left-color: #ffc107; background-color: #fcf8e3; }
-            .flag.low { border-left-color: #5bc0de; background-color: #d9edf7; }
-            .flag.critical { border-left-color: #c9302c; background-color: #f2dede; font-weight: bold; }
-            .field-value { color: #666; font-size: 12px; margin-top: 5px; }
-            .confidence-badge { display: inline-block; padding: 2px 8px; border-radius: 3px; font-size: 11px; margin-left: 5px; }
-            .confidence-high { background-color: #5cb85c; color: white; }
-            .confidence-medium { background-color: #ffc107; color: white; }
-            .confidence-low { background-color: #d9534f; color: white; }
-            .action { color: #d9534f; font-weight: bold; margin-top: 10px; }
-        </style>
-    </head>
-    <body>
+    validated_entries = validation_result.get('validated_entries', [])
+    
+    total_entries = len(validated_entries)
+    passed_entries = validation_result['validation_summary']['clean_entries']
+    flagged_entries = validation_result['validation_summary']['flagged_entries']
+    
+    date_flags_count = 0
+    bill_detail_flags_count = 0
+    party_corrections_count = 0
+    low_confidence_entries_count = 0
+    
+    for entry_result in validated_entries:
+        original = entry_result['original_entry']
+        flags = entry_result['flags']
+        
+        # Count date flags
+        if any(flag.get('field') == 'date' for flag in flags):
+            date_flags_count += 1
+            
+        # Count bill detail flags
+        if any(flag.get('field') == 'bill_details' for flag in flags):
+            bill_detail_flags_count += 1
+            
+        # Count party corrections
+        original_party = original.get('original_party', original.get('party'))
+        resolved_party = original.get('party')
+        if original_party != resolved_party and resolved_party != 'UNCLEAR' and original_party != 'UNCLEAR':
+            party_corrections_count += 1
+            
+        # Count low confidence entries
+        if any(flag.get('type') == 'LOW_CONFIDENCE' for flag in flags):
+            low_confidence_entries_count += 1
+
+    review_percentage = validation_result['validation_summary']['review_percentage']
+    client_name = validation_result.get('bill_metadata', {}).get('client_name', 'M/S LALCHAND RAMCHAND, VASHI')
+    bill_period = validation_result.get('bill_metadata', {}).get('bill_period', 'April 2025 - March 2026')
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bill Verification Report</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {{
+            --primary: #1e3a8a;
+            --primary-light: #3b82f6;
+            --bg-main: #f8fafc;
+            --card-bg: #ffffff;
+            --text-dark: #0f172a;
+            --text-muted: #64748b;
+            --border: #e2e8f0;
+            --success: #22c55e;
+            --success-bg: #f0fdf4;
+            --warning: #eab308;
+            --warning-bg: #fefce8;
+            --danger: #ef4444;
+            --danger-bg: #fef2f2;
+            --info: #06b6d4;
+            --info-bg: #ecfeff;
+        }}
+        
+        * {{
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }}
+        
+        body {{
+            font-family: 'Inter', sans-serif;
+            background-color: var(--bg-main);
+            color: var(--text-dark);
+            line-height: 1.5;
+            padding: 30px 20px;
+        }}
+        
+        .container {{
+            max-width: 1200px;
+            margin: 0 auto;
+        }}
+        
+        .header {{
+            background: linear-gradient(135deg, var(--primary), #1e40af);
+            color: white;
+            padding: 30px;
+            border-radius: 12px;
+            margin-bottom: 25px;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+        }}
+        
+        .header h1 {{
+            font-size: 24px;
+            font-weight: 700;
+            margin-bottom: 8px;
+        }}
+        
+        .header p {{
+            font-size: 14px;
+            opacity: 0.9;
+        }}
+        
+        .meta-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-top: 20px;
+            border-top: 1px solid rgba(255, 255, 255, 0.1);
+            padding-top: 20px;
+        }}
+        
+        .meta-item .label {{
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            opacity: 0.7;
+        }}
+        
+        .meta-item .value {{
+            font-size: 14px;
+            font-weight: 600;
+            margin-top: 4px;
+        }}
+        
+        /* Stats Cards */
+        .stats-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+            gap: 15px;
+            margin-bottom: 30px;
+        }}
+        
+        .stat-card {{
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            padding: 15px;
+            border-radius: 10px;
+            text-align: center;
+            box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.05);
+            transition: transform 0.2s;
+        }}
+        
+        .stat-card:hover {{
+            transform: translateY(-2px);
+        }}
+        
+        .stat-card .label {{
+            font-size: 11px;
+            font-weight: 600;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }}
+        
+        .stat-card .value {{
+            font-size: 22px;
+            font-weight: 700;
+            margin-top: 5px;
+            color: var(--primary);
+        }}
+        
+        .stat-card.flagged .value {{ color: var(--danger); }}
+        .stat-card.passed .value {{ color: var(--success); }}
+        
+        /* Table styles */
+        .table-container {{
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
+            margin-bottom: 30px;
+        }}
+        
+        .actions-bar {{
+            padding: 15px 20px;
+            border-bottom: 1px solid var(--border);
+            background: #f8fafc;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }}
+        
+        .actions-bar h2 {{
+            font-size: 16px;
+            font-weight: 600;
+        }}
+        
+        .btn {{
+            background-color: var(--primary-light);
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 6px;
+            font-size: 12px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: background 0.2s;
+        }}
+        
+        .btn:hover {{
+            background-color: var(--primary);
+        }}
+        
+        .btn-secondary {{
+            background-color: #cbd5e1;
+            color: var(--text-dark);
+            margin-left: 10px;
+        }}
+        
+        .btn-secondary:hover {{
+            background-color: #94a3b8;
+        }}
+        
+        table {{
+            width: 100%;
+            border-collapse: collapse;
+            text-align: left;
+        }}
+        
+        th {{
+            background-color: #f1f5f9;
+            color: var(--text-muted);
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            padding: 12px 20px;
+            border-bottom: 1px solid var(--border);
+        }}
+        
+        td {{
+            padding: 14px 20px;
+            border-bottom: 1px solid var(--border);
+            font-size: 13px;
+        }}
+        
+        .entry-row {{
+            cursor: pointer;
+            transition: background 0.15s;
+        }}
+        
+        .entry-row:hover {{
+            background-color: #f8fafc;
+        }}
+        
+        .entry-row.flagged-row {{
+            background-color: rgba(239, 68, 68, 0.01);
+        }}
+        
+        .entry-row.flagged-row:hover {{
+            background-color: rgba(239, 68, 68, 0.03);
+        }}
+        
+        /* Status Badges */
+        .badge {{
+            display: inline-block;
+            padding: 3px 8px;
+            font-size: 10px;
+            font-weight: 600;
+            border-radius: 4px;
+            text-transform: uppercase;
+        }}
+        
+        .badge-pass {{
+            background-color: var(--success-bg);
+            color: var(--success);
+            border: 1px solid rgba(34, 197, 94, 0.2);
+        }}
+        
+        .badge-review {{
+            background-color: var(--danger-bg);
+            color: var(--danger);
+            border: 1px solid rgba(239, 68, 68, 0.2);
+        }}
+        
+        /* Confidence Badges */
+        .conf-badge {{
+            display: inline-block;
+            font-size: 10px;
+            font-weight: 500;
+            padding: 2px 6px;
+            border-radius: 3px;
+        }}
+        
+        .conf-high {{
+            background-color: var(--success-bg);
+            color: var(--success);
+        }}
+        
+        .conf-medium {{
+            background-color: var(--warning-bg);
+            color: var(--warning);
+        }}
+        
+        .conf-low {{
+            background-color: var(--danger-bg);
+            color: var(--danger);
+        }}
+        
+        /* Details row expansion */
+        .details-row {{
+            background-color: #f8fafc;
+        }}
+        
+        .details-container {{
+            padding: 20px;
+            border-left: 4px solid var(--primary-light);
+            background: #ffffff;
+            margin: 10px 20px;
+            border-radius: 6px;
+            box-shadow: inset 0 2px 4px 0 rgba(0, 0, 0, 0.03), 0 1px 3px 0 rgba(0,0,0,0.05);
+        }}
+        
+        .details-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 15px;
+            margin-bottom: 15px;
+        }}
+        
+        .detail-field {{
+            border: 1px solid var(--border);
+            padding: 10px;
+            border-radius: 6px;
+            background: #fafafa;
+        }}
+        
+        .detail-field .label {{
+            font-size: 10px;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            font-weight: 600;
+        }}
+        
+        .detail-field .value {{
+            font-size: 13px;
+            font-weight: 600;
+            margin-top: 4px;
+        }}
+        
+        .detail-field .original-val {{
+            font-size: 11px;
+            color: var(--text-muted);
+            font-style: italic;
+            margin-top: 2px;
+            border-top: 1px dashed var(--border);
+            padding-top: 2px;
+        }}
+        
+        .issues-section {{
+            margin-top: 15px;
+            border-top: 1px solid var(--border);
+            padding-top: 15px;
+        }}
+        
+        .issues-title {{
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--danger);
+            margin-bottom: 8px;
+        }}
+        
+        .flag-item {{
+            background-color: var(--danger-bg);
+            border-left: 3px solid var(--danger);
+            padding: 10px;
+            margin-bottom: 8px;
+            border-radius: 4px;
+            font-size: 12px;
+        }}
+        
+        .flag-item.medium {{
+            background-color: var(--warning-bg);
+            border-left-color: var(--warning);
+            color: #854d0e;
+        }}
+        
+        .flag-item.low {{
+            background-color: var(--info-bg);
+            border-left-color: var(--info);
+            color: #0e7490;
+        }}
+        
+        .action-required {{
+            margin-top: 12px;
+            color: var(--danger);
+            font-weight: 600;
+            font-size: 12px;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
         <div class="header">
             <h1>Bill Verification Report</h1>
-            <p>Review flagged entries. No action needed on clean entries.</p>
+            <p>Verification dashboard for Haroon & Sons bill extraction. Click any row to expand details and review flags.</p>
+            <div class="meta-grid">
+                <div class="meta-item">
+                    <div class="label">Client Name</div>
+                    <div class="value">{client_name}</div>
+                </div>
+                <div class="meta-item">
+                    <div class="label">Bill Period</div>
+                    <div class="value">{bill_period}</div>
+                </div>
+                <div class="meta-item">
+                    <div class="label">Status</div>
+                    <div class="value">{"⚠️ Review Required" if flagged_entries > 0 else "✓ Processed"}</div>
+                </div>
+            </div>
         </div>
         
-        <div class="summary">
-            <div class="summary-stat">
+        <!-- Summary Stats Grid -->
+        <div class="stats-grid">
+            <div class="stat-card">
                 <div class="label">Total Entries</div>
-                <div class="value">""" + str(validation_result['validation_summary']['total_entries']) + """</div>
+                <div class="value">{total_entries}</div>
             </div>
-            <div class="summary-stat">
-                <div class="label">Flagged (Review)</div>
-                <div class="value" style="color: #d9534f;">""" + str(validation_result['validation_summary']['flagged_entries']) + """</div>
+            <div class="stat-card passed">
+                <div class="label">Passed</div>
+                <div class="value">{passed_entries}</div>
             </div>
-            <div class="summary-stat">
-                <div class="label">Clean (Skip)</div>
-                <div class="value" style="color: #5cb85c;">""" + str(validation_result['validation_summary']['clean_entries']) + """</div>
+            <div class="stat-card flagged">
+                <div class="label">Flagged</div>
+                <div class="value">{flagged_entries}</div>
             </div>
-            <div class="summary-stat">
+            <div class="stat-card">
                 <div class="label">Review %</div>
-                <div class="value">""" + str(validation_result['validation_summary']['review_percentage']) + """%</div>
+                <div class="value">{review_percentage}%</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Date Flags</div>
+                <div class="value">{date_flags_count}</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Bill Flags</div>
+                <div class="value">{bill_detail_flags_count}</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Party Normalized</div>
+                <div class="value">{party_corrections_count}</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Low Conf.</div>
+                <div class="value">{low_confidence_entries_count}</div>
             </div>
         </div>
-    """
-    
-    for entry_result in validation_result['validated_entries']:
+        
+        <!-- Table container -->
+        <div class="table-container">
+            <div class="actions-bar">
+                <h2>Transactions Checklist</h2>
+                <div>
+                    <button class="btn" onclick="expandAllFlagged()">Expand Flagged</button>
+                    <button class="btn btn-secondary" onclick="collapseAll()">Collapse All</button>
+                </div>
+            </div>
+            
+            <table>
+                <thead>
+                    <tr>
+                        <th style="width: 80px;">Entry</th>
+                        <th>Date</th>
+                        <th>Qty</th>
+                        <th>Rate</th>
+                        <th>Party</th>
+                        <th>Bill Details</th>
+                        <th>Status</th>
+                        <th>Flags</th>
+                    </tr>
+                </thead>
+                <tbody>
+"""
+
+    for entry_result in validated_entries:
         entry = entry_result['original_entry']
         flags = entry_result['flags']
         needs_review = entry_result['needs_review']
+        entry_num = entry_result['entry_number']
         
-        entry_class = 'flagged' if needs_review else 'clean'
-        status_icon = '⚠️ FLAGGED' if needs_review else '✓ OK'
+        status_badge = f'<span class="badge badge-review">Review</span>' if needs_review else f'<span class="badge badge-pass">Pass</span>'
+        row_class = 'flagged-row' if needs_review else 'clean-row'
+        
+        # Gather flag summary
+        flag_summary_list = []
+        for flag in flags:
+            f_type = flag.get('type', '')
+            # shorten type for summary column
+            short_type = f_type.replace('_OUTLIER', '').replace('_RISK', '').replace('LOW_', '').replace('UNCLEAR_', '').title()
+            if short_type not in flag_summary_list:
+                flag_summary_list.append(short_type)
+        
+        flags_column = ", ".join(flag_summary_list) if flags else "-"
         
         html += f"""
-        <div class="entry {entry_class}">
-            <div class="entry-header">
-                {status_icon} Entry {entry_result['entry_number']}
-                <span class="entry-number">({entry_result['flag_count']} flags)</span>
-            </div>
-            
-            <div style="margin: 10px 0; padding: 10px; background-color: rgba(0,0,0,0.02); border-radius: 3px;">
-                <div><strong>Date:</strong> {entry['date']} <span class="confidence-badge confidence-{entry['date_confidence'].lower()}">{entry['date_confidence']}</span></div>
-                <div><strong>Katta:</strong> {entry['katta']} <span class="confidence-badge confidence-{entry['katta_confidence'].lower()}">{entry['katta_confidence']}</span></div>
-                <div><strong>Rate:</strong> {entry['rate']} <span class="confidence-badge confidence-{entry['rate_confidence'].lower()}">{entry['rate_confidence']}</span></div>
-                <div><strong>Party:</strong> {entry['party']} <span class="confidence-badge confidence-{entry['party_confidence'].lower()}">{entry['party_confidence']}</span></div>
-                <div><strong>Bill Details:</strong> {entry['bill_details'] or '(empty)'} <span class="confidence-badge confidence-{entry['bill_details_confidence'].lower()}">{entry['bill_details_confidence']}</span></div>
-            </div>
+                    <tr class="entry-row {row_class}" onclick="toggleDetails('{entry_num}')">
+                        <td><strong>{entry_num}</strong></td>
+                        <td><span class="conf-badge conf-{entry.get('date_confidence', 'high').lower()}">{entry.get('date_confidence')}</span></td>
+                        <td><span class="conf-badge conf-{entry.get('katta_confidence', 'high').lower()}">{entry.get('katta_confidence')}</span></td>
+                        <td><span class="conf-badge conf-{entry.get('rate_confidence', 'high').lower()}">{entry.get('rate_confidence')}</span></td>
+                        <td><span class="conf-badge conf-{entry.get('party_confidence', 'high').lower()}">{entry.get('party_confidence')}</span></td>
+                        <td><span class="conf-badge conf-{entry.get('bill_details_confidence', 'high').lower()}">{entry.get('bill_details_confidence')}</span></td>
+                        <td>{status_badge}</td>
+                        <td style="color: var(--text-muted); font-size: 11px;">{flags_column}</td>
+                    </tr>
+                    <tr id="details-{entry_num}" class="details-row" style="display: none;">
+                        <td colspan="8">
+                            <div class="details-container">
+                                <h3 style="font-size: 14px; margin-bottom: 12px; color: var(--primary);">Entry {entry_num} Extracted Values</h3>
+                                <div class="details-grid">
+                                    <div class="detail-field">
+                                        <div class="label">Date</div>
+                                        <div class="value">{entry.get('date')}</div>
+                                    </div>
+                                    <div class="detail-field">
+                                        <div class="label">Katta / Quantity</div>
+                                        <div class="value">{entry.get('katta')}</div>
+                                    </div>
+                                    <div class="detail-field">
+                                        <div class="label">Rate</div>
+                                        <div class="value">{entry.get('rate') if entry.get('rate') != "" else "(Blank / Missing)"}</div>
+                                        {f'<div class="original-val">Original: {entry_result.get("original_entry", {}).get("rate")}</div>' if entry.get('rate') == "" and entry_result.get("original_entry", {}).get("rate") else ""}
+                                    </div>
+                                    <div class="detail-field">
+                                        <div class="label">Party Name</div>
+                                        <div class="value">{entry.get('party')}</div>
+                                        {f'<div class="original-val">Original: {entry.get("original_party")}</div>' if entry.get('party') != entry.get('original_party') else ""}
+                                    </div>
+                                    <div class="detail-field">
+                                        <div class="label">Bill Details</div>
+                                        <div class="value">{entry.get('bill_details') or "(Empty)"}</div>
+                                    </div>
+                                </div>
         """
         
         if flags:
-            html += "<div style='margin-top: 10px;'><strong>Issues:</strong>"
-            for flag in flags:
-                severity_class = flag.get('severity', 'MEDIUM').lower()
-                html += f"""
-                <div class="flag {severity_class}">
-                    <strong>{flag['type']}</strong>: {flag['message']}
-                </div>
-                """
-            html += "</div>"
-        
-        if needs_review:
             html += """
-            <div class="action">
-                ➜ ACTION: Check handwritten bill. Verify this entry. Correct if jumbled or unclear.
-            </div>
+                                <div class="issues-section">
+                                    <div class="issues-title">Detected Issues Requiring Review:</div>
             """
-        
-        html += "</div>"
-    
+            for flag in flags:
+                sev = flag.get('severity', 'MEDIUM').lower()
+                html += f"""
+                                    <div class="flag-item {sev}">
+                                        <strong>{flag.get('type')}:</strong> {flag.get('message')}
+                                    </div>
+                """
+            html += """
+                                    <div class="action-required">
+                                        ➜ Action Required: Check handwritten bill. Verify the flagged fields above. Correct the final Excel output if needed.
+                                    </div>
+                                </div>
+            """
+        else:
+            html += """
+                                <div style="color: var(--success); font-size: 12px; font-weight: 500; margin-top: 10px;">
+                                    ✓ This entry passed all validation checks cleanly. No action required.
+                                </div>
+            """
+            
+        html += """
+                            </div>
+                        </td>
+                    </tr>
+        """
+
     html += """
-        <div style="margin-top: 30px; padding: 20px; background-color: #e8f4f8; border-radius: 5px;">
-            <h3>Next Steps:</h3>
-            <ol>
-                <li>Review all <strong>FLAGGED</strong> entries above against the handwritten bill</li>
-                <li>Correct any errors (wrong numbers, jumbled fields, unclear party names)</li>
-                <li>Once verified, system will generate final XLS</li>
-                <li>Do NOT worry about CLEAN entries - they passed validation</li>
-            </ol>
+                </tbody>
+            </table>
         </div>
-    </body>
-    </html>
-    """
+    </div>
     
+    <script>
+        function toggleDetails(id) {
+            var row = document.getElementById("details-" + id);
+            if (row.style.display === "none") {
+                row.style.display = "table-row";
+            } else {
+                row.style.display = "none";
+            }
+        }
+        
+        function expandAllFlagged() {
+            var flaggedRows = document.querySelectorAll(".flagged-row");
+            flaggedRows.forEach(function(row) {
+                var entryNum = row.cells[0].innerText.trim();
+                var details = document.getElementById("details-" + entryNum);
+                if (details) {
+                    details.style.display = "table-row";
+                }
+            });
+        }
+        
+        function collapseAll() {
+            var detailsRows = document.querySelectorAll(".details-row");
+            detailsRows.forEach(function(row) {
+                row.style.display = "none";
+            });
+        }
+    </script>
+</body>
+</html>
+"""
+
     return html

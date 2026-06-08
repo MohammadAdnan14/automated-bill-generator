@@ -28,26 +28,70 @@ class BillFormatter:
         self.company_name = "HAROON & SONS"
         self.company_subtitle = "COPRA & OIL BROKERS"
         self.company_address = "OFFICE: 371/73, Narshi Natha Street, 2/A. Faize-E-Edroos Building, Mumbai - 400 009"
-    
     def prepare_entries(self, validated_entries: List[Dict]) -> List[Dict]:
         """
-        Prepare entries for output: calculate brokerage, sort by date.
+        Prepare entries for output: parse values, calculate brokerage, sort by date.
         """
         prepared = []
+        import re
         
         for entry in validated_entries:
             original = entry['original_entry']
             
-            try:
-                katta = int(original['katta'])
-                brokerage = katta * self.brokerage_rate
-            except:
-                brokerage = 0
+            # 1. Parse quantity (katta)
+            original_katta = original.get('katta', '')
+            katta_val = ""
+            brokerage = ""
             
+            # Check for commercial unit suffix (e.g. BAGS, BOX, etc.)
+            is_commercial = False
+            if isinstance(original_katta, str):
+                is_commercial = any(unit in original_katta.upper() for unit in ['BAG', 'BOX', 'PACKET', 'PKT'])
+                
+            if is_commercial:
+                # Keep the original string as is
+                katta_val = original_katta
+                brokerage = "" # Leave brokerage blank for commercial units!
+            else:
+                # Parse numeric value
+                try:
+                    if isinstance(original_katta, str):
+                        num_match = re.search(r'([\d\.]+)', original_katta)
+                        if num_match:
+                            katta_num = float(num_match.group(1))
+                        else:
+                            raise ValueError()
+                    else:
+                        katta_num = float(original_katta)
+                    
+                    # Convert to int if whole number
+                    if katta_num.is_integer():
+                        katta_num = int(katta_num)
+                        
+                    katta_val = katta_num
+                    
+                    # Brokerage only depends on quantity, calculate if present
+                    brokerage = katta_num * self.brokerage_rate
+                except:
+                    katta_val = original_katta
+                    brokerage = ""
+            
+            # 2. Parse rate (original rate is mutated to "" if implausible/missing in validation)
+            original_rate = original.get('rate', '')
+            rate_val = ""
+            try:
+                if original_rate is not None and str(original_rate).strip() not in ['', 'None', 'null']:
+                    rate_num = float(original_rate)
+                    if rate_num.is_integer():
+                        rate_num = int(rate_num)
+                    rate_val = rate_num
+            except:
+                rate_val = original_rate
+                
             prepared.append({
                 'date': original['date'],
-                'katta': original['katta'],
-                'rate': original['rate'],
+                'katta': katta_val,
+                'rate': rate_val,
                 'party': original['party'],
                 'bill_details': original.get('bill_details', ''),
                 'brokerage': brokerage
@@ -57,7 +101,7 @@ class BillFormatter:
         prepared.sort(key=lambda x: datetime.strptime(x['date'], "%d-%m-%Y"))
         
         return prepared
-    
+        
     def generate_xls(self, prepared_entries: List[Dict], output_path: str) -> str:
         """
         Generate Excel file with proper formatting.
@@ -133,23 +177,29 @@ class BillFormatter:
         
         # Add data rows
         row += 1
-        total_brokerage = 0
+        total_brokerage = 0.0
         for entry in prepared_entries:
             ws.cell(row=row, column=1).value = entry['date']
-            ws.cell(row=row, column=2).value = int(entry['katta'])
-            ws.cell(row=row, column=3).value = float(entry['rate'])
+            ws.cell(row=row, column=2).value = entry['katta']
+            ws.cell(row=row, column=3).value = entry['rate']
             ws.cell(row=row, column=4).value = entry['party']
             ws.cell(row=row, column=5).value = entry['bill_details']
-            ws.cell(row=row, column=6).value = entry['brokerage']
             
-            total_brokerage += entry['brokerage']
+            brokerage = entry['brokerage']
+            ws.cell(row=row, column=6).value = brokerage
+            
+            if isinstance(brokerage, (int, float)):
+                total_brokerage += brokerage
             
             # Style data row
             for col_num in range(1, 7):
                 cell = ws.cell(row=row, column=col_num)
                 cell.border = border
-                if col_num in [2, 3, 6]:  # Numeric columns
+                val = cell.value
+                if col_num in [2, 3, 6]:  # Quantity, Rate, Brokerage
                     cell.alignment = Alignment(horizontal='right')
+                    if isinstance(val, float):
+                        cell.number_format = '0.00'
                 else:
                     cell.alignment = Alignment(horizontal='left')
             
@@ -166,15 +216,19 @@ class BillFormatter:
         cell.fill = PatternFill(start_color="E8F4F8", end_color="E8F4F8", fill_type="solid")
         
         cell = ws[f'F{row}']
+        # If total_brokerage is integer-like, write as int
+        if total_brokerage.is_integer():
+            total_brokerage = int(total_brokerage)
         cell.value = total_brokerage
         cell.font = Font(bold=True, size=11)
         cell.border = border
         cell.alignment = Alignment(horizontal='right')
         cell.fill = PatternFill(start_color="E8F4F8", end_color="E8F4F8", fill_type="solid")
+        if isinstance(total_brokerage, float):
+            cell.number_format = '0.00'
         
         wb.save(output_path)
         return output_path
-    
 
 
 # Test the formatter
@@ -182,19 +236,19 @@ if __name__ == "__main__":
     sample_prepared = [
         {
             'date': '07-04-2025',
-            'katta': '400',
-            'rate': '218',
+            'katta': 400,
+            'rate': 218,
             'party': 'M/S MUSKHAN ENTERPRISES',
             'bill_details': 'Bill 6',
             'brokerage': 2000
         },
         {
             'date': '12-04-2025',
-            'katta': '400',
-            'rate': '202',
+            'katta': '30 BAGS',
+            'rate': 202,
             'party': 'M/S SHAAN ENTERPRISES',
             'bill_details': 'Bill 124',
-            'brokerage': 2000
+            'brokerage': ""
         }
     ]
     
@@ -206,9 +260,5 @@ if __name__ == "__main__":
     )
     
     # Generate XLS
-    xls_path = formatter.generate_xls(sample_prepared, '/tmp/test_bill.xlsx')
+    xls_path = formatter.generate_xls(sample_prepared, 'test_bill.xlsx')
     print(f"XLS generated: {xls_path}")
-    
-    # Generate PDF
-    pdf_path = formatter.generate_pdf(sample_prepared, '/tmp/test_bill.pdf')
-    print(f"PDF generated: {pdf_path}")

@@ -21,22 +21,28 @@ Extract transaction entries from a handwritten bill image. Return structured JSO
   - If month >= 4: use the earlier year
   - Example: For "April 2025 - March 2026" period, entry dated "3/5" → 3/5/25 (month 5 >= 4, use 2025)
   - Example: For "April 2025 - March 2026" period, entry dated "2/3" → 2/3/26 (month 3 < 4, use 2026)
-- If uncertain about specific digit (especially 6, which often looks like 5/8/9), mark confidence as MEDIUM or LOW
+- **Digit 6 Date Confusions (CRITICAL):** Handwritten "6" is frequently misread as "8" or "0" in dates. If the day or month contains the digit "6", "8", or "0" (e.g. 10-06 vs 10-08), and there is ANY handwriting ambiguity, you MUST NOT assign HIGH confidence. Default to MEDIUM or LOW confidence.
 - **Do NOT hallucinate dates.** Only infer year from bill period; never guess or assume a date not present in the handwritten record.
-- Confidence: HIGH if date is clear and legible, MEDIUM if slightly unclear, LOW if very ambiguous
+- Confidence: HIGH if date is clear and legible, MEDIUM if slightly unclear or contains potential digit confusions (6 vs 8/0), LOW if very ambiguous
 
 ### QUANTITY (Katta/Kg/Tons/Bags/Boxes)
 **Prioritization:**
 - If there are two weight quantities, prioritize the one resembling "katta" (e.g., "katta", "kotta", "kotho")
 
-**Unit Conversion (Apply BEFORE Clubbing):**
+**Unit Conversion & Unit Preservation (CRITICAL):**
 - **Katta:** Extract numerical value only (e.g., "64 katta" → 64)
 - **Kg to Katta:** 1 kg = 1/25 katta. Divide kg value by 25.
   - Example: 500 kg → 500 ÷ 25 = 20 katta
   - Example: 1890 kg → 1890 ÷ 25 = 75.6 katta
 - **Tons to Katta:** 1 ton = 40 katta. Multiply ton value by 40.
+  - Example: 1 ton → 1 × 40 = 40 katta (NEVER output 100!)
   - Example: 2 tons → 2 × 40 = 80 katta
-- **Bags/Boxes:** Write the full text (e.g., "15 bags" → "15 bags"). Do NOT convert.
+- **Bags/Boxes/Packets (Commercial Units):** Commercial units must **NEVER** be converted to katta. You must preserve the unit exactly as written!
+  - Example: "30 bags" → output "30 BAGS" (NEVER strip the unit to just output "30"!)
+  - Example: "10 box" → output "10 BOX"
+  - Example: "15 bag" → output "15 BAG"
+  - Commercial units include: BAG, BAGS, BOX, BOXES, PACKET, PKT, etc.
+- **Convert ONLY:** KG, TON, and KATTA.
 
 **Clubbing Logic (CRITICAL):**
 A single handwritten entry may contain multiple sub-quantities with individual rates.
@@ -49,7 +55,7 @@ A single handwritten entry may contain multiple sub-quantities with individual r
     - Row 2: 70.8 katta | 305 (1770 ÷ 25)
 - **Total Keyword:** If "TOTAL" is present, use it ONLY as verification. Cross-check by summing clubbed quantities. Do NOT use total as primary source.
 
-**Output:** Katta value should be a number (int or float). If conversion results in decimal (e.g., 75.6), include the decimal.
+**Output:** Katta value should be a number (int or float) unless it's a commercial unit where it must be a string containing the unit. If conversion results in decimal (e.g., 75.6), include the decimal.
 
 Confidence: HIGH if number is clear, MEDIUM if any digit is ambiguous, LOW if mostly unclear
 
@@ -58,6 +64,7 @@ Confidence: HIGH if number is clear, MEDIUM if any digit is ambiguous, LOW if mo
 - This is the price per katta (after any conversions)
 - Each sub-quantity within a single entry may have its own rate — apply the clubbing logic above
 - Typical range: 100-500
+- If the rate is completely missing or implausible in the handwritten text (e.g. rate is blank or scribbled as 1), output `null` or `""` (empty string) for the rate. Do NOT invent a rate.
 - If digit 6 is involved, mark MEDIUM confidence minimum
 - Confidence: HIGH if number is clear, MEDIUM if slightly unclear, LOW if very ambiguous
 
