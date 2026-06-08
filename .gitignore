@@ -1,7 +1,23 @@
-bill/
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment files (contains sensitive API keys!)
+.env
+
+# Virtual environment
+venv/
+
+# Local/temporary outputs
+extracted_*.json
+validation_*.json
+verification_report_*.html
+bill_*.xlsx
+
+# Project documentation/logs
 PROJECT_SUMMARY.md
 SETUP_GUIDE.md
-project_summary.md
-setup_guide.md
-venv/
-.env
+
+# Bills and inputs directory
+bill/

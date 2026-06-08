@@ -282,7 +282,7 @@ def load_party_list(party_list_file: str) -> Dict[str, str]:
     party_dict = {}
     
     try:
-        with open(party_list_file, 'r') as f:
+        with open(party_list_file, 'r', encoding='utf-8') as f:
             lines = f.readlines()
         
         for line in lines:

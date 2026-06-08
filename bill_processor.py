@@ -16,11 +16,18 @@ import argparse
 import json
 import base64
 import sys
+import os
 from pathlib import Path
 from datetime import datetime
-import google.generativeai as genai
-from validation_script import BillValidator, generate_verification_report
+from typing import Dict
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types
+from validation_script import BillValidator, generate_verification_report, load_party_list
 from formatting_script import BillFormatter
+
+# Load environment variables from .env file
+load_dotenv()
 
 
 def load_image_as_base64(image_path: str) -> str:
@@ -31,31 +38,30 @@ def load_image_as_base64(image_path: str) -> str:
 
 def get_extraction_prompt() -> str:
     """Get the extraction prompt from extraction_prompt.md"""
-    with open('extraction_prompt.md', 'r') as f:
+    with open('extraction_prompt.md', 'r', encoding='utf-8') as f:
         return f.read()
 
 
-def extract_with_gemini(pdf_path: str, api_key: str) -> Dict:
+def extract_with_gemini(pdf_path: str, api_key: str, model_name: str = "gemini-2.5-flash") -> Dict:
     """
-    Send PDF to Gemini for extraction.
+    Send PDF to Gemini for extraction using new google-genai SDK.
     
     Args:
         pdf_path: Path to PDF file
         api_key: Gemini API key
+        model_name: Gemini model name
     
     Returns:
         Extracted JSON with confidence scores
     """
-    genai.configure(api_key=api_key)
+    client = genai.Client(api_key=api_key)
     
     # Load prompt
     prompt = get_extraction_prompt()
     
-    # Load image
-    if pdf_path.lower().endswith('.pdf'):
-        print("Warning: PDF detected. Converting to base64. For best results, use JPG/PNG.")
-    
-    image_data = load_image_as_base64(pdf_path)
+    # Load file bytes
+    with open(pdf_path, 'rb') as f:
+        file_bytes = f.read()
     
     # Determine media type
     if pdf_path.lower().endswith('.pdf'):
@@ -67,23 +73,20 @@ def extract_with_gemini(pdf_path: str, api_key: str) -> Dict:
     else:
         media_type = "image/jpeg"
     
-    # Create message with image
-    model = genai.GenerativeModel('gemini-1.5-flash')
-    
-    message = model.generate_content([
-        {
-            "type": "text",
-            "text": prompt
-        },
-        {
-            "type": "image",
-            "mime_type": media_type,
-            "data": image_data
-        }
-    ])
+    # Generate content using modern SDK format
+    response = client.models.generate_content(
+        model=model_name,
+        contents=[
+            types.Part.from_bytes(
+                data=file_bytes,
+                mime_type=media_type
+            ),
+            prompt
+        ]
+    )
     
     # Parse response
-    response_text = message.text
+    response_text = response.text
     
     # Extract JSON from response
     try:
@@ -110,21 +113,27 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python bill_processor.py --pdf bill.jpg --api-key YOUR_KEY --client "M/S LALCHAND RAMCHAND, VASHI"
+  python bill_processor.py --pdf bill.jpg --client "M/S LALCHAND RAMCHAND, VASHI"
         """
     )
     
     parser.add_argument('--pdf', required=True, help='Path to handwritten bill PDF/JPG')
-    parser.add_argument('--api-key', required=True, help='Gemini or Claude API key')
-    parser.add_argument('--llm', default='gemini', choices=['gemini', 'claude'], help='LLM provider (default: gemini)')
+    parser.add_argument('--api-key', default=os.getenv('GEMINI_API_KEY'), help='Gemini or Claude API key (defaults to GEMINI_API_KEY in .env)')
+    parser.add_argument('--llm', default='gemini-2.5-flash', help='LLM provider (default: gemini-2.5-flash)')
     parser.add_argument('--brokerage-rate', type=int, default=5, choices=[5, 10], help='Brokerage rate in rupees (default: 5)')
-    parser.add_argument('--client', default='M/S LALCHAND RAMCHAND, VASHI', help='Client name for bill header')
+    parser.add_argument('--client', required=True, help='Client name for bill header')
     parser.add_argument('--period-start', default='01-04-2025', help='Bill period start (DD-MM-YYYY)')
     parser.add_argument('--period-end', default='31-03-2026', help='Bill period end (DD-MM-YYYY)')
     parser.add_argument('--output-dir', default='.', help='Output directory for XLS and PDF')
+    parser.add_argument('--party-list', default='bill/party.txt', help='Path to master party list file (default: bill/party.txt)')
     
     args = parser.parse_args()
     
+    # Validate API key exists
+    if not args.api_key:
+        print("Error: API key not found. Please provide it via --api-key or set GEMINI_API_KEY in a .env file.")
+        sys.exit(1)
+        
     # Validate inputs
     pdf_path = Path(args.pdf)
     if not pdf_path.exists():
@@ -140,18 +149,28 @@ Examples:
     
     # Step 1: Extract
     print(f"\n[1/4] Extracting data from {pdf_path.name}...")
-    extracted = extract_with_gemini(str(pdf_path), args.api_key)
+    extracted = extract_with_gemini(str(pdf_path), args.api_key, args.llm)
     print(f"✓ Extracted {len(extracted.get('transactions', []))} entries")
     
     # Save extracted JSON
     extracted_json_path = output_dir / f"extracted_{pdf_path.stem}.json"
-    with open(extracted_json_path, 'w') as f:
+    with open(extracted_json_path, 'w', encoding='utf-8') as f:
         json.dump(extracted, f, indent=2)
     print(f"✓ Saved extracted data: {extracted_json_path}")
     
     # Step 2: Validate
     print(f"\n[2/4] Validating entries...")
-    validator = BillValidator(bill_period_start=args.period_start, bill_period_end=args.period_end)
+    party_dict = load_party_list(args.party_list) if args.party_list else None
+    if party_dict:
+        print(f"✓ Loaded party list from {args.party_list} with {len(party_dict)} entries/aliases")
+    else:
+        print(f"⚠️  No party list loaded (validation checks will skip party verification)")
+        
+    validator = BillValidator(
+        bill_period_start=args.period_start,
+        bill_period_end=args.period_end,
+        party_list=party_dict
+    )
     validation_result = validator.validate_bill(extracted)
     
     flagged = validation_result['validation_summary']['flagged_entries']
@@ -160,7 +179,7 @@ Examples:
     
     # Save validation result
     validation_json_path = output_dir / f"validation_{pdf_path.stem}.json"
-    with open(validation_json_path, 'w') as f:
+    with open(validation_json_path, 'w', encoding='utf-8') as f:
         json.dump(validation_result, f, indent=2)
     print(f"✓ Saved validation result: {validation_json_path}")
     
@@ -169,7 +188,7 @@ Examples:
     html_report = generate_verification_report(validation_result)
     
     report_path = output_dir / f"verification_report_{pdf_path.stem}.html"
-    with open(report_path, 'w') as f:
+    with open(report_path, 'w', encoding='utf-8') as f:
         f.write(html_report)
     print(f"✓ Generated verification report: {report_path}")
     print(f"\n⚠️  NEXT STEP: Open the HTML report and review flagged entries")
